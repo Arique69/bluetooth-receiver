@@ -18,7 +18,7 @@ Turn a Windows laptop into a Bluetooth speaker for your iPhone, with a Spotify-s
 ## Install
 
 ```
-pip install winrt-runtime winrt-Windows.Media.Audio winrt-Windows.Devices.Enumeration winrt-Windows.Devices.Bluetooth winrt-Windows.Devices.Bluetooth.GenericAttributeProfile winrt-Windows.Storage.Streams winrt-Windows.Foundation winrt-Windows.Foundation.Collections pillow
+pip install winrt-runtime winrt-Windows.Media.Audio winrt-Windows.Devices.Enumeration winrt-Windows.Devices.Bluetooth winrt-Windows.Devices.Bluetooth.GenericAttributeProfile winrt-Windows.Storage.Streams winrt-Windows.Foundation winrt-Windows.Foundation.Collections pillow pykakasi
 ```
 
 ## Usage

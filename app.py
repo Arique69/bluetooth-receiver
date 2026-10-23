@@ -2,13 +2,15 @@
 Needs Windows 10 2004+ and:
 pip install winrt-runtime winrt-Windows.Media.Audio winrt-Windows.Devices.Enumeration winrt-Windows.Devices.Bluetooth
     winrt-Windows.Devices.Bluetooth.GenericAttributeProfile winrt-Windows.Storage.Streams winrt-Windows.Foundation
-    winrt-Windows.Foundation.Collections pillow
+    winrt-Windows.Foundation.Collections pillow pykakasi
 """
 import asyncio
+import bisect
 import colorsys
 import io
 import json
 import os
+import re
 import threading
 import time
 import tkinter as tk
@@ -18,6 +20,7 @@ import uuid
 import zlib
 from tkinter import font as tkfont
 
+import pykakasi
 from PIL import Image, ImageDraw, ImageTk
 
 from winrt.windows.devices.bluetooth import BluetoothCacheMode, BluetoothConnectionStatus, BluetoothLEDevice
@@ -46,6 +49,8 @@ BG, CARD, FG, MUTED, TRACKBAR, GREEN = "#121212", "#282828", "#ffffff", "#b3b3b3
 FONT = "Segoe UI"
 W = 360  # content width
 COVERS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "covers")  # downloaded art, so repeats work offline
+LYRICS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lyrics")
+kakasi = pykakasi.kakasi()  # Japanese -> romaji
 
 loop = asyncio.new_event_loop()
 threading.Thread(target=loop.run_forever, daemon=True).start()
@@ -88,6 +93,37 @@ def fetch_cover(title, artist):
             fh.write(data)
         return data
     return None
+
+
+def romaji(line):
+    return " ".join(w for w in (p["hepburn"].strip() for p in kakasi.convert(line)) if w)
+
+
+def parse_lrc(text):
+    """'[mm:ss.xx] line' -> sorted [(seconds, line)]. Japanese songs (any kana) come back in romaji."""
+    lines = sorted((int(m) * 60 + float(s), line.strip()) for m, s, line in re.findall(r"\[(\d+):(\d+(?:\.\d+)?)\](.*)", text))
+    if re.search(r"[぀-ヿ]", text):  # kana, not just kanji, so Chinese lyrics are left alone
+        lines = [(s, romaji(line)) for s, line in lines]
+    return lines
+
+
+def fetch_lyrics(title, artist):
+    """Synced lyrics from the local cache or LRCLIB, [] if the song has none, None if offline."""
+    path = os.path.join(LYRICS, f"{zlib.crc32(f'{title}|{artist}'.encode()):08x}.lrc")
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as fh:
+            return parse_lrc(fh.read())
+    url = "https://lrclib.net/api/search?" + urllib.parse.urlencode({"track_name": title, "artist_name": artist})
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "bluetooth-receiver"})
+        results = json.load(urllib.request.urlopen(req, timeout=8))
+    except Exception:
+        return None
+    text = next((r["syncedLyrics"] for r in results if r.get("syncedLyrics")), "")
+    os.makedirs(LYRICS, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:  # cache misses too (empty file), so we don't ask again
+        fh.write(text)
+    return parse_lrc(text)
 
 
 def smooth(w, h, draw, bg=BG, ss=4):
@@ -197,6 +233,14 @@ class App:
         self.play.bind("<Button-1>", lambda e: self.media(CMD_TOGGLE))
         self.play.pack(side="left", padx=18)
         self.skip_button(ctrl, CMD_NEXT).pack(side="left", padx=18)
+
+        # lyrics: previous / current / next line
+        self.lyrics, self.lyrics_ready = [], None  # lyrics None = still downloading
+        self.f_lyric = tkfont.Font(family=FONT, size=12, weight="bold")
+        self.lyric_labels = [(tk.Label(root, text="", bg=BG, fg=fg, font=f, anchor="w"), f)
+                             for fg, f in ((MUTED, self.f_body), (FG, self.f_lyric), (MUTED, self.f_body))]
+        for lbl, _ in self.lyric_labels:
+            lbl.pack(fill="x")
 
         self.status = tk.Label(root, text="", bg=BG, fg=MUTED, font=self.f_small, anchor="w")
         self.status.pack(fill="x")
@@ -373,9 +417,12 @@ class App:
         if key != self.cover_key:
             self.cover_key = key
             self.draw_cover(key)
+            self.lyrics = None if t["title"] else []
             if t["title"]:
                 threading.Thread(target=lambda k=key, ti=t["title"], ar=t["artist"]:
                                  setattr(self, "cover_ready", (k, fetch_cover(ti, ar))), daemon=True).start()
+                threading.Thread(target=lambda k=key, ti=t["title"], ar=t["artist"]:
+                                 setattr(self, "lyrics_ready", (k, fetch_lyrics(ti, ar))), daemon=True).start()
             self.title.config(text=clip(t["title"] or "Nothing playing", self.f_title, W))
             self.artist.config(text=clip(t["artist"], self.f_body, W))
         if self.cover_ready:
@@ -385,6 +432,11 @@ class App:
                 self.cover_img = ImageTk.PhotoImage(Image.open(io.BytesIO(data)).resize((W, W), Image.LANCZOS))
                 self.cover.delete("all")
                 self.cover.create_image(0, 0, image=self.cover_img, anchor="nw")
+        if self.lyrics_ready:
+            k, lines = self.lyrics_ready
+            self.lyrics_ready = None
+            if k == key:
+                self.lyrics = lines or []
         self.play.config(image=self.icons["pause" if t["playing"] else "play"])
 
         # iPhone only reports elapsed at state changes; extrapolate with playback rate between them
@@ -402,6 +454,15 @@ class App:
         b.create_image(0, 0, image=self.bar_img, anchor="nw")
         self.t_elapsed.config(text=mmss(elapsed))
         self.t_total.config(text=mmss(dur))
+
+        ly = self.lyrics
+        if ly:
+            i = bisect.bisect_right([s for s, _ in ly], elapsed) - 1  # line being sung, -1 before the first
+            texts = [(ly[j][1] or "♪") if 0 <= j < len(ly) else "" for j in (i - 1, i, i + 1)]
+        else:
+            texts = ["", "Loading lyrics…" if ly is None else "No lyrics" if t["title"] else "", ""]
+        for (lbl, f), text in zip(self.lyric_labels, texts):
+            lbl.config(text=clip(text, f, W))
 
         self.root.after(250, self.render)
 
